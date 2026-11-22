@@ -1101,6 +1101,12 @@ object NativeLibrary {
         // TODO: replace these with Hotkey buttons - they aren't native!
         const val BUTTON_SWAP = 800
         const val BUTTON_TURBO = 801
+        const val BUTTON_TURBO_2 = 802
+        const val BUTTON_TURBO_3 = 803
+        const val BUTTON_QUICKSAVE = 804
+        const val BUTTON_QUICKLOAD = 805
+        const val BUTTON_PAUSE = 806
+        const val BUTTON_SCREENSHOT = 807
     }
 
     /**

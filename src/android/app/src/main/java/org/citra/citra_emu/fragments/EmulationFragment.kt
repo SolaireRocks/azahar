@@ -28,8 +28,11 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -72,6 +75,10 @@ import org.citra.citra_emu.features.settings.model.IntSetting
 import org.citra.citra_emu.features.settings.ui.SettingsActivity
 import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.model.Game
+import org.citra.citra_emu.overlay.ButtonSlidingMode
+import org.citra.citra_emu.overlay.InputOverlay
+import org.citra.citra_emu.overlay.OverlayControl
+import org.citra.citra_emu.overlay.OverlayProfileManager
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.DirectoryInitialization.DirectoryInitializationState
 import org.citra.citra_emu.utils.EmulationLifecycleUtil
@@ -79,6 +86,7 @@ import org.citra.citra_emu.utils.EmulationMenuSettings
 import org.citra.citra_emu.utils.GameHelper
 import org.citra.citra_emu.utils.GameIconUtils
 import org.citra.citra_emu.utils.Log
+import org.citra.citra_emu.utils.ScreenshotHelper
 import org.citra.citra_emu.utils.TurboHelper
 import org.citra.citra_emu.utils.ViewUtils
 import org.citra.citra_emu.viewmodel.EmulationViewModel
@@ -199,10 +207,7 @@ class EmulationFragment :
             return
         }
         binding.surfaceEmulation.holder.addCallback(this)
-        binding.doneControlConfig.setOnClickListener {
-            binding.doneControlConfig.visibility = View.GONE
-            binding.surfaceInputOverlay.setIsInEditMode(false)
-        }
+        setupOverlayActionsAndEditor()
 
         // Show/hide the "Stats" overlay
         updateShowPerformanceOverlay()
@@ -487,6 +492,8 @@ class EmulationFragment :
                 repeatOnLifecycle(Lifecycle.State.CREATED) {
                     emulationViewModel.emulationStarted.collectLatest { started ->
                         if (started) {
+                            OverlayProfileManager.applyProfileForRunningGame()
+                            binding.surfaceInputOverlay.refreshControls()
                             ViewUtils.hideView(binding.loadingIndicator)
                             ViewUtils.showView(binding.surfaceInputOverlay)
                             binding.inGameMenu.menu.findItem(R.id.menu_emulation_savestates)
@@ -514,6 +521,31 @@ class EmulationFragment :
             emulationState.unpause()
         } else {
             emulationState.pause()
+        }
+        updatePauseMenuItem()
+        if (_binding != null) {
+            binding.surfaceInputOverlay.invalidate()
+        }
+    }
+
+    private fun updatePauseMenuItem() {
+        if (_binding == null || !::emulationState.isInitialized) return
+        binding.inGameMenu.menu.findItem(R.id.menu_emulation_pause)?.let { item ->
+            if (emulationState.isPaused) {
+                item.title = resources.getString(R.string.resume_emulation)
+                item.icon = ResourcesCompat.getDrawable(
+                    resources,
+                    R.drawable.ic_play,
+                    requireContext().theme
+                )
+            } else {
+                item.title = resources.getString(R.string.pause_emulation)
+                item.icon = ResourcesCompat.getDrawable(
+                    resources,
+                    R.drawable.ic_pause,
+                    requireContext().theme
+                )
+            }
         }
     }
 
@@ -773,8 +805,18 @@ class EmulationFragment :
                     true
                 }
 
+                R.id.menu_emulation_overlay_profiles -> {
+                    showControllerProfilesDialog()
+                    true
+                }
+
                 R.id.menu_emulation_toggle_controls -> {
                     showToggleControlsDialog()
+                    true
+                }
+
+                R.id.menu_emulation_turbo_speeds -> {
+                    showTurboSpeedsDialog()
                     true
                 }
 
@@ -865,6 +907,42 @@ class EmulationFragment :
 
                 R.id.menu_emulation_adjust_scale_button_turbo -> {
                     showAdjustScaleDialog("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO)
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_turbo_2 -> {
+                    showAdjustScaleDialog("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO_2)
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_turbo_3 -> {
+                    showAdjustScaleDialog("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO_3)
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_quicksave -> {
+                    showAdjustScaleDialog(
+                        "controlScale-" + NativeLibrary.ButtonType.BUTTON_QUICKSAVE
+                    )
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_quickload -> {
+                    showAdjustScaleDialog(
+                        "controlScale-" + NativeLibrary.ButtonType.BUTTON_QUICKLOAD
+                    )
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_pause -> {
+                    showAdjustScaleDialog("controlScale-" + NativeLibrary.ButtonType.BUTTON_PAUSE)
+                    true
+                }
+
+                R.id.menu_emulation_adjust_scale_button_screenshot -> {
+                    showAdjustScaleDialog(
+                        "controlScale-" + NativeLibrary.ButtonType.BUTTON_SCREENSHOT
+                    )
                     true
                 }
 
@@ -1240,27 +1318,558 @@ class EmulationFragment :
         popupMenu.show()
     }
 
+    private var editorCollapsed = false
+    private var editorDragLastRawX = 0f
+    private var editorDragLastRawY = 0f
+
+    @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
+    private fun setupOverlayActionsAndEditor() {
+        binding.surfaceInputOverlay.actionListener = object : InputOverlay.OverlayActionListener {
+            override fun onQuicksave() {
+                NativeLibrary.saveState(NativeLibrary.QUICKSAVE_SLOT)
+                Toast.makeText(
+                    requireContext(),
+                    getString(R.string.saving),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
+            override fun onQuickload() {
+                val wasLoaded = NativeLibrary.loadStateIfAvailable(NativeLibrary.QUICKSAVE_SLOT)
+                val stringRes = if (wasLoaded) {
+                    R.string.loading
+                } else {
+                    R.string.quickload_not_found
+                }
+                Toast.makeText(
+                    requireContext(),
+                    getString(stringRes),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
+            override fun onOpenSavestatePicker(isSaving: Boolean) {
+                showSavestatePickerDialog(isSaving)
+            }
+
+            override fun onTogglePause() {
+                togglePause()
+            }
+
+            override fun onOpenDrawerMenu() {
+                binding.drawerLayout.open()
+            }
+
+            override fun onTakeScreenshot() {
+                ScreenshotHelper.capture(requireContext(), binding.surfaceEmulation)
+            }
+
+            override fun isEmulationPaused(): Boolean =
+                ::emulationState.isInitialized && emulationState.isPaused
+
+            override fun onSelectedControlChanged(control: OverlayControl?) {
+                updateEditorSelectedControl(control)
+            }
+        }
+
+        binding.doneControlConfig.setOnClickListener {
+            OverlayProfileManager.commitEditSession()
+            binding.overlayEditToolbar.visibility = View.GONE
+            binding.surfaceInputOverlay.setIsInEditMode(false)
+        }
+
+        binding.btnEditorDiscard.setOnClickListener {
+            OverlayProfileManager.discardEditSession()
+            binding.surfaceInputOverlay.refreshControls()
+            binding.overlayEditToolbar.visibility = View.GONE
+            binding.surfaceInputOverlay.setIsInEditMode(false)
+        }
+
+        binding.btnEditorReset.setOnClickListener {
+            resetInputOverlay()
+            syncEditorToolbarState()
+            updateEditorSelectedControl(binding.surfaceInputOverlay.selectedControl)
+        }
+
+        binding.btnEditorProfiles.setOnClickListener {
+            showControllerProfilesDialog()
+        }
+
+        binding.btnEditorControls.setOnClickListener {
+            showToggleControlsDialog()
+        }
+
+        binding.btnEditorTurboSpeeds.setOnClickListener {
+            showTurboSpeedsDialog()
+        }
+
+        binding.btnEditorGrid.setOnClickListener {
+            OverlayProfileManager.gridSnapEnabled = !OverlayProfileManager.gridSnapEnabled
+            syncEditorToolbarState()
+            binding.surfaceInputOverlay.invalidate()
+        }
+
+        binding.btnEditorSlide.setOnClickListener {
+            val nextMode = (EmulationMenuSettings.buttonSlide + 1) % 3
+            EmulationMenuSettings.buttonSlide = nextMode
+            syncEditorToolbarState()
+        }
+
+        binding.btnEditorFloatingStick.setOnClickListener {
+            EmulationMenuSettings.joystickRelCenter = !EmulationMenuSettings.joystickRelCenter
+            syncEditorToolbarState()
+        }
+
+        binding.btnEditorCollapse.setOnClickListener {
+            editorCollapsed = !editorCollapsed
+            binding.editorBodyContainer.visibility =
+                if (editorCollapsed) View.GONE else View.VISIBLE
+            binding.btnEditorCollapse.text = if (editorCollapsed) "▼" else "▲"
+        }
+
+        var lastTapMs = 0L
+        binding.editorDragHandle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastTapMs < 300L) {
+                        binding.overlayEditToolbar.translationX = 0f
+                        binding.overlayEditToolbar.translationY = 0f
+                    }
+                    lastTapMs = now
+                    editorDragLastRawX = event.rawX
+                    editorDragLastRawY = event.rawY
+                    true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - editorDragLastRawX
+                    val dy = event.rawY - editorDragLastRawY
+                    binding.overlayEditToolbar.translationX += dx
+                    binding.overlayEditToolbar.translationY += dy
+                    editorDragLastRawX = event.rawX
+                    editorDragLastRawY = event.rawY
+                    true
+                }
+
+                else -> true
+            }
+        }
+
+        binding.sliderEditorOpacity.addOnChangeListener { _, value, fromUser ->
+            val intVal = value.toInt().coerceIn(0, 100)
+            binding.textEditorOpacityValue.text = "$intVal%"
+            if (fromUser) {
+                setControlOpacity(intVal)
+            }
+        }
+
+        binding.sliderSelectedControlSize.addOnChangeListener { _, value, fromUser ->
+            val ctrl = binding.surfaceInputOverlay.selectedControl ?: return@addOnChangeListener
+            val scaleInt = value.toInt().coerceIn(0, 150)
+            binding.textSelectedControlSizeValue.text = "${scaleInt + 50}%"
+            if (fromUser) {
+                setControlScale(scaleInt, ctrl.scalePrefKey)
+            }
+        }
+
+        binding.btnSelectedControlToggle.setOnClickListener {
+            val ctrl = binding.surfaceInputOverlay.selectedControl ?: return@setOnClickListener
+            val currentEnabled = preferences.getBoolean(ctrl.togglePrefKey, ctrl.defaultEnabled)
+            preferences.edit().putBoolean(ctrl.togglePrefKey, !currentEnabled).apply()
+            binding.surfaceInputOverlay.refreshControls()
+            updateEditorSelectedControl(ctrl)
+        }
+
+        binding.sliderSelectedTurboSpeed.addOnChangeListener { _, value, fromUser ->
+            val ctrl = binding.surfaceInputOverlay.selectedControl ?: return@addOnChangeListener
+            val slot = TurboHelper.slotForButtonId(ctrl.id)
+            if (slot <= 0) return@addOnChangeListener
+            val speed = value.toInt().coerceIn(
+                TurboHelper.TURBO_MIN_SPEED,
+                TurboHelper.TURBO_UNLIMITED_SPEED
+            )
+            binding.textSelectedTurboValue.text = TurboHelper.formatSpeedLabel(speed)
+            if (fromUser) {
+                TurboHelper.setTurboSpeed(slot, speed)
+                binding.surfaceInputOverlay.invalidate()
+            }
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun syncEditorToolbarState() {
+        OverlayProfileManager.ensureLoaded()
+        binding.textEditorProfileBadge.text = getString(
+            R.string.overlay_profile_active_badge,
+            OverlayProfileManager.activeProfileName
+        )
+        binding.btnEditorGrid.text = getString(
+            if (OverlayProfileManager.gridSnapEnabled) {
+                R.string.overlay_editor_grid_on
+            } else {
+                R.string.overlay_editor_grid_off
+            }
+        )
+        binding.btnEditorSlide.text = getString(
+            when (EmulationMenuSettings.buttonSlide) {
+                ButtonSlidingMode.Enabled.int -> R.string.overlay_editor_slide_on
+                ButtonSlidingMode.Alternative.int -> R.string.overlay_editor_slide_hold
+                else -> R.string.overlay_editor_slide_off
+            }
+        )
+        binding.btnEditorFloatingStick.text = getString(
+            if (EmulationMenuSettings.joystickRelCenter) {
+                R.string.overlay_editor_floating_on
+            } else {
+                R.string.overlay_editor_floating_off
+            }
+        )
+        val opacity = preferences.getInt("controlOpacity", 50).coerceIn(0, 100)
+        binding.sliderEditorOpacity.value = opacity.toFloat()
+        binding.textEditorOpacityValue.text = "$opacity%"
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun updateEditorSelectedControl(control: OverlayControl?) {
+        if (_binding == null) return
+        if (control == null) {
+            binding.selectedControlContainer.visibility = View.GONE
+            binding.selectedTurboContainer.visibility = View.GONE
+            binding.textEditorHint.visibility = View.VISIBLE
+            return
+        }
+
+        binding.textEditorHint.visibility = View.GONE
+        binding.selectedControlContainer.visibility = View.VISIBLE
+        binding.textSelectedControlName.text = "${control.shortLabel} Size"
+
+        val scale = preferences.getInt(control.scalePrefKey, 50).coerceIn(0, 150)
+        binding.sliderSelectedControlSize.value = scale.toFloat()
+        binding.textSelectedControlSizeValue.text = "${scale + 50}%"
+
+        val isEnabled = preferences.getBoolean(control.togglePrefKey, control.defaultEnabled)
+        binding.btnSelectedControlToggle.text = getString(
+            if (isEnabled) R.string.overlay_editor_hide else R.string.overlay_editor_show
+        )
+
+        val turboSlot = TurboHelper.slotForButtonId(control.id)
+        if (turboSlot > 0) {
+            binding.selectedTurboContainer.visibility = View.VISIBLE
+            binding.textSelectedTurboLabel.text = getString(
+                R.string.emulation_turbo_speed_slot,
+                turboSlot
+            )
+            val speed = TurboHelper.getTurboSpeed(turboSlot)
+            val snappedValue =
+                ((speed / 5) * 5).coerceIn(
+                    TurboHelper.TURBO_MIN_SPEED,
+                    TurboHelper.TURBO_UNLIMITED_SPEED
+                )
+            binding.sliderSelectedTurboSpeed.value = snappedValue.toFloat()
+            binding.textSelectedTurboValue.text = TurboHelper.formatSpeedLabel(snappedValue)
+        } else {
+            binding.selectedTurboContainer.visibility = View.GONE
+        }
+
+        // Auto-dock the toolbar to the opposite vertical half from the selected control
+        val orientation =
+            if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
+                "-Portrait"
+            } else {
+                ""
+            }
+        val controlY = preferences.getFloat(control.yPrefKey(orientation), 0f)
+        val overlayHeight = binding.surfaceInputOverlay.height
+        if (overlayHeight > 0 &&
+            binding.overlayEditToolbar.translationX == 0f &&
+            binding.overlayEditToolbar.translationY == 0f
+        ) {
+            val dockBottom = controlY < overlayHeight * 0.45f
+            val lp =
+                binding.overlayEditToolbar.layoutParams as? CoordinatorLayout.LayoutParams
+            if (lp != null) {
+                val targetGravity =
+                    if (dockBottom) {
+                        Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                    } else {
+                        Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    }
+                if (lp.gravity != targetGravity) {
+                    lp.gravity = targetGravity
+                    binding.overlayEditToolbar.layoutParams = lp
+                }
+            }
+        }
+    }
+
+    private fun showSavestatePickerDialog(isSaving: Boolean) {
+        val savestates = NativeLibrary.getSavestateInfo() ?: emptyArray()
+        val slotLabels = Array(NativeLibrary.SAVESTATE_SLOT_COUNT) { i ->
+            val match = savestates.firstOrNull { it.slot == i }
+            if (i == NativeLibrary.QUICKSAVE_SLOT) {
+                if (match != null) {
+                    getString(R.string.emulation_occupied_quicksave_slot, match.time)
+                } else {
+                    getString(R.string.emulation_quicksave_slot)
+                }
+            } else {
+                if (match != null) {
+                    getString(R.string.emulation_occupied_state_slot, i, match.time)
+                } else {
+                    getString(R.string.emulation_empty_state_slot, i)
+                }
+            }
+        }
+
+        val titleRes =
+            if (isSaving) R.string.emulation_save_state else R.string.emulation_load_state
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(titleRes)
+            .setItems(slotLabels) { _, which ->
+                if (isSaving) {
+                    NativeLibrary.saveState(which)
+                    Toast.makeText(
+                        requireContext(),
+                        getString(R.string.saving),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    val loaded = NativeLibrary.loadStateIfAvailable(which)
+                    val msg = if (loaded) R.string.loading else R.string.quickload_not_found
+                    Toast.makeText(
+                        requireContext(),
+                        getString(msg),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun showControllerProfilesDialog() {
+        val ctx = requireContext()
+        val density = resources.displayMetrics.density
+        val pad = (16 * density).toInt()
+
+        val rootScroll = ScrollView(ctx)
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, pad / 2)
+        }
+        rootScroll.addView(container)
+
+        lateinit var dialog: androidx.appcompat.app.AlertDialog
+
+        fun rebuildList() {
+            container.removeAllViews()
+            val profiles = OverlayProfileManager.getProfiles()
+            val activeName = OverlayProfileManager.activeProfileName
+
+            for (profile in profiles) {
+                val isActive = profile.name == activeName
+                val row = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(
+                        (12 * density).toInt(),
+                        (10 * density).toInt(),
+                        (12 * density).toInt(),
+                        (10 * density).toInt()
+                    )
+                    setBackgroundColor(
+                        if (isActive) 0x443A6EA5 else 0x1AFFFFFF
+                    )
+                }
+                val rowParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = (6 * density).toInt()
+                }
+
+                val nameView = TextView(ctx).apply {
+                    text = if (isActive) "● ${profile.name}" else "  ${profile.name}"
+                    textSize = 15f
+                    layoutParams = LinearLayout.LayoutParams(
+                        0,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        1f
+                    )
+                }
+                row.setOnClickListener {
+                    OverlayProfileManager.switchProfile(profile.name)
+                    binding.surfaceInputOverlay.refreshControls()
+                    syncEditorToolbarState()
+                    updateEditorSelectedControl(binding.surfaceInputOverlay.selectedControl)
+                    rebuildList()
+                }
+                row.addView(nameView)
+
+                if (profiles.size > 1) {
+                    val deleteBtn = TextView(ctx).apply {
+                        text = getString(R.string.overlay_profile_delete)
+                        setTextColor(0xFFFF6B6B.toInt())
+                        textSize = 13f
+                        setPadding((8 * density).toInt(), 0, (4 * density).toInt(), 0)
+                        setOnClickListener {
+                            OverlayProfileManager.deleteProfile(profile.name)
+                            binding.surfaceInputOverlay.refreshControls()
+                            syncEditorToolbarState()
+                            rebuildList()
+                        }
+                    }
+                    row.addView(deleteBtn)
+                }
+
+                container.addView(row, rowParams)
+            }
+
+            val newRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, (8 * density).toInt(), 0, 0)
+            }
+            val input = EditText(ctx).apply {
+                hint = getString(R.string.overlay_profile_new_hint)
+                isSingleLine = true
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f
+                )
+            }
+            val saveAsBtn = TextView(ctx).apply {
+                text = getString(R.string.overlay_profile_save_as)
+                setTextColor(0xFFFFFFFF.toInt())
+                setBackgroundColor(0xFF3A6EA5.toInt())
+                setPadding(
+                    (14 * density).toInt(),
+                    (10 * density).toInt(),
+                    (14 * density).toInt(),
+                    (10 * density).toInt()
+                )
+                setOnClickListener {
+                    val name = input.text?.toString()?.trim().orEmpty()
+                    if (name.isNotEmpty()) {
+                        OverlayProfileManager.saveAsNewProfile(name)
+                        syncEditorToolbarState()
+                        rebuildList()
+                    }
+                }
+            }
+            newRow.addView(input)
+            newRow.addView(saveAsBtn)
+            container.addView(newRow)
+        }
+
+        rebuildList()
+
+        dialog = MaterialAlertDialogBuilder(ctx)
+            .setTitle(R.string.emulation_controller_profiles)
+            .setView(rootScroll)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun showTurboSpeedsDialog() {
+        val ctx = requireContext()
+        val density = resources.displayMetrics.density
+        val pad = (20 * density).toInt()
+
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, pad / 2)
+        }
+
+        for (slot in 1..TurboHelper.TURBO_SLOT_COUNT) {
+            val headerRow = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val titleView = TextView(ctx).apply {
+                text = getString(R.string.emulation_turbo_speed_slot, slot)
+                textSize = 14f
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f
+                )
+            }
+            val currentSpeed = TurboHelper.getTurboSpeed(slot)
+            val snappedInitial =
+                ((currentSpeed / 5) * 5).coerceIn(
+                    TurboHelper.TURBO_MIN_SPEED,
+                    TurboHelper.TURBO_UNLIMITED_SPEED
+                )
+            val valueView = TextView(ctx).apply {
+                text = TurboHelper.formatSpeedLabel(snappedInitial)
+                textSize = 14f
+            }
+            headerRow.addView(titleView)
+            headerRow.addView(valueView)
+            container.addView(headerRow)
+
+            val slider = Slider(ctx).apply {
+                valueFrom = TurboHelper.TURBO_MIN_SPEED.toFloat()
+                valueTo = TurboHelper.TURBO_UNLIMITED_SPEED.toFloat()
+                stepSize = 5f
+                value = snappedInitial.toFloat()
+                addOnChangeListener { _, newVal, fromUser ->
+                    val speedInt = newVal.toInt()
+                    valueView.text = TurboHelper.formatSpeedLabel(speedInt)
+                    if (fromUser) {
+                        TurboHelper.setTurboSpeed(slot, speedInt)
+                        binding.surfaceInputOverlay.invalidate()
+                        updateEditorSelectedControl(binding.surfaceInputOverlay.selectedControl)
+                    }
+                }
+            }
+            container.addView(slider)
+        }
+
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle(R.string.emulation_turbo_speeds)
+            .setView(container)
+            .setPositiveButton(android.R.string.ok, null)
+            .setNeutralButton(R.string.slider_default) { _, _ ->
+                TurboHelper.setTurboSpeed(1, 200)
+                TurboHelper.setTurboSpeed(2, 300)
+                TurboHelper.setTurboSpeed(3, 400)
+                binding.surfaceInputOverlay.invalidate()
+                updateEditorSelectedControl(binding.surfaceInputOverlay.selectedControl)
+            }
+            .show()
+    }
+
     private fun editControlsPlacement() {
         if (binding.surfaceInputOverlay.isInEditMode) {
-            binding.doneControlConfig.visibility = View.GONE
+            OverlayProfileManager.commitEditSession()
+            binding.overlayEditToolbar.visibility = View.GONE
             binding.surfaceInputOverlay.setIsInEditMode(false)
         } else {
-            binding.doneControlConfig.visibility = View.VISIBLE
+            OverlayProfileManager.beginEditSession()
+            editorCollapsed = false
+            binding.editorBodyContainer.visibility = View.VISIBLE
+            binding.btnEditorCollapse.text = "▲"
+            binding.overlayEditToolbar.translationX = 0f
+            binding.overlayEditToolbar.translationY = 0f
+            syncEditorToolbarState()
+            updateEditorSelectedControl(null)
+            binding.overlayEditToolbar.visibility = View.VISIBLE
             binding.surfaceInputOverlay.setIsInEditMode(true)
         }
     }
 
     private fun showToggleControlsDialog() {
         val editor = preferences.edit()
-        val enabledButtons = BooleanArray(17)
-        enabledButtons.forEachIndexed { i: Int, _: Boolean ->
-            // Buttons that are disabled by default
-            var defaultValue = true
-            when (i) {
-                // TODO: Remove these magic numbers
-                6, 7, 12, 13, 14, 15, 16 -> defaultValue = false
-            }
-            enabledButtons[i] = preferences.getBoolean("buttonToggle$i", defaultValue)
+        val controls = OverlayControl.entries
+        val enabledButtons = BooleanArray(controls.size) { i ->
+            val ctrl = controls[i]
+            preferences.getBoolean(ctrl.togglePrefKey, ctrl.defaultEnabled)
         }
 
         val dialog = MaterialAlertDialogBuilder(requireContext())
@@ -1269,11 +1878,13 @@ class EmulationFragment :
                 R.array.n3dsButtons,
                 enabledButtons
             ) { _: DialogInterface?, indexSelected: Int, isChecked: Boolean ->
-                editor.putBoolean("buttonToggle$indexSelected", isChecked)
+                val ctrl = controls.getOrNull(indexSelected) ?: return@setMultiChoiceItems
+                editor.putBoolean(ctrl.togglePrefKey, isChecked)
             }
             .setPositiveButton(android.R.string.ok) { _: DialogInterface?, _: Int ->
                 editor.apply()
                 binding.surfaceInputOverlay.refreshControls()
+                updateEditorSelectedControl(binding.surfaceInputOverlay.selectedControl)
             }
             .show()
 
@@ -1281,8 +1892,6 @@ class EmulationFragment :
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val displayMetrics = requireActivity().windowManager.currentWindowMetrics
             val displayHeight = displayMetrics.bounds.height()
-            // The layout visually breaks if we try to set the height directly rather than like this.
-            // Why? Fuck you, that's why!
             val newAttributes = dialog.window?.attributes
             newAttributes?.height = (displayHeight * 0.85f).toInt()
             dialog.window?.attributes = newAttributes
@@ -1420,23 +2029,9 @@ class EmulationFragment :
 
     private fun resetAllScales() {
         resetScale("controlScale")
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_A)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_B)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_X)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_Y)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.TRIGGER_L)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.TRIGGER_R)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_ZL)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_ZR)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_START)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_SELECT)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.DPAD)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.STICK_LEFT)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.STICK_C)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_HOME)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_SWAP)
-        resetScale("controlScale-" + NativeLibrary.ButtonType.BUTTON_TURBO)
-        resetScale("controlScale-" + Hotkey.COMBO_BUTTON.button)
+        for (control in OverlayControl.entries) {
+            resetScale(control.scalePrefKey)
+        }
         binding.surfaceInputOverlay.refreshControls()
     }
 
@@ -1464,13 +2059,8 @@ class EmulationFragment :
             .apply()
 
         val editor = preferences.edit()
-        // TODO: This code sucks balls. We need to do this differently. -OS
-        for (i in 0 until 17) {
-            var defaultValue = true
-            when (i) {
-                6, 7, 12, 13, 14, 15, 16 -> defaultValue = false
-            }
-            editor.putBoolean("buttonToggle$i", defaultValue)
+        for (control in OverlayControl.entries) {
+            editor.putBoolean(control.togglePrefKey, control.defaultEnabled)
         }
         editor.apply()
 

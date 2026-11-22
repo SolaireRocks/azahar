@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the misc/licenses/gplv2.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 package org.citra.citra_emu.overlay
 
@@ -39,7 +39,8 @@ class InputOverlayDrawableJoystick(
     rectOuter: Rect,
     rectInner: Rect,
     val joystickId: Int,
-    val opacity: Int
+    val opacity: Int,
+    var enabled: Boolean = true
 ) {
     var trackId = -1
     var xAxis = 0f
@@ -86,10 +87,18 @@ class InputOverlayDrawableJoystick(
         outerBitmap.alpha = opacity
     }
 
-    fun draw(canvas: Canvas?) {
+    fun draw(canvas: Canvas?, isEditMode: Boolean = false) {
+        val drawOpacity = if (isEditMode && !enabled) {
+            (opacity * 0.45f).toInt().coerceIn(40, 255)
+        } else {
+            opacity
+        }
+        if (!pressedState) {
+            outerBitmap.alpha = drawOpacity
+        }
         outerBitmap.draw(canvas!!)
         boundsBoxBitmap.draw(canvas)
-        currentStateBitmapDrawable.alpha = opacity
+        currentStateBitmapDrawable.alpha = drawOpacity
         currentStateBitmapDrawable.draw(canvas)
     }
 
@@ -99,6 +108,7 @@ class InputOverlayDrawableJoystick(
         hasActiveButtons: Boolean,
         overlay: InputOverlay
     ): Boolean {
+        if (!enabled) return false
         val xPosition = event.getX(pointerIndex).toInt()
         val yPosition = event.getY(pointerIndex).toInt()
         val pointerId = event.getPointerId(pointerIndex)

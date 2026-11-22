@@ -6,26 +6,30 @@ package org.citra.citra_emu.overlay
 
 import android.app.Activity
 import android.content.Context
-import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.VectorDrawable
 import android.os.Build
 import android.util.AttributeSet
 import android.util.DisplayMetrics
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.SurfaceView
 import android.view.View
 import android.view.View.OnTouchListener
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.preference.PreferenceManager
-import java.lang.NullPointerException
+import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.roundToInt
 import org.citra.citra_emu.CitraApplication
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
@@ -39,20 +43,100 @@ import org.citra.citra_emu.utils.TurboHelper
 /**
  * Draws the interactive input overlay on top of the
  * [SurfaceView] that is rendering emulation.
- *
- * @param context The current [Context].
- * @param attrs   [AttributeSet] for parsing XML attributes.
  */
 class InputOverlay(context: Context?, attrs: AttributeSet?) :
     SurfaceView(context, attrs),
     OnTouchListener {
-    private val overlayButtons: MutableSet<InputOverlayDrawableButton> = HashSet()
-    private val overlayDpads: MutableSet<InputOverlayDrawableDpad> = HashSet()
-    private val overlayJoysticks: MutableSet<InputOverlayDrawableJoystick> = HashSet()
+
+    interface OverlayActionListener {
+        fun onQuicksave()
+        fun onQuickload()
+        fun onOpenSavestatePicker(isSaving: Boolean)
+        fun onTogglePause()
+        fun onOpenDrawerMenu()
+        fun onTakeScreenshot()
+        fun isEmulationPaused(): Boolean
+        fun onSelectedControlChanged(control: OverlayControl?)
+    }
+
+    private val overlayButtons: MutableSet<InputOverlayDrawableButton> = LinkedHashSet()
+    private val overlayDpads: MutableSet<InputOverlayDrawableDpad> = LinkedHashSet()
+    private val overlayJoysticks: MutableSet<InputOverlayDrawableJoystick> = LinkedHashSet()
+
     private var isInEditMode = false
     private var buttonBeingConfigured: InputOverlayDrawableButton? = null
     private var dpadBeingConfigured: InputOverlayDrawableDpad? = null
     private var joystickBeingConfigured: InputOverlayDrawableJoystick? = null
+
+    var selectedControl: OverlayControl? = null
+        private set
+
+    var actionListener: OverlayActionListener? = null
+
+    private var editDownX = 0f
+    private var editDownY = 0f
+    private var editMoved = false
+    private var editTouchedEmptySpace = false
+    private var isPinchScaling = false
+    private var pinchBaseScale = 50f
+
+    private val editBackdropPaint = Paint().apply {
+        color = Color.argb(90, 0, 0, 0)
+        style = Paint.Style.FILL
+    }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(38, 255, 255, 255)
+        strokeWidth = 1.5f
+    }
+    private val adornmentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+    }
+    private val disabledCrossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(215, 255, 85, 85)
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val adornmentRect = RectF()
+
+    private val scaleGestureDetector = ScaleGestureDetector(
+        getContext(),
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                if (!isInEditMode) return false
+                if (selectedControl == null) {
+                    val hit = findControlAt(detector.focusX.toInt(), detector.focusY.toInt())
+                    if (hit != null) {
+                        selectControl(hit)
+                    }
+                }
+                val ctrl = selectedControl ?: return false
+                isPinchScaling = true
+                buttonBeingConfigured = null
+                dpadBeingConfigured = null
+                joystickBeingConfigured = null
+                pinchBaseScale = preferences.getInt(ctrl.scalePrefKey, 50).toFloat()
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val ctrl = selectedControl ?: return false
+                val currentDisplayPct = pinchBaseScale + 50f
+                val newDisplayPct = (currentDisplayPct * detector.scaleFactor).coerceIn(50f, 200f)
+                pinchBaseScale = newDisplayPct - 50f
+                val newScaleInt = pinchBaseScale.roundToInt().coerceIn(0, 150)
+                if (preferences.getInt(ctrl.scalePrefKey, 50) != newScaleInt) {
+                    preferences.edit().putInt(ctrl.scalePrefKey, newScaleInt).apply()
+                    refreshControls()
+                    actionListener?.onSelectedControlChanged(ctrl)
+                }
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                isPinchScaling = false
+            }
+        }
+    )
 
     // Stores the ID of the pointer that interacted with the 3DS touchscreen.
     private var touchscreenPointerId = -1
@@ -61,6 +145,8 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
         if (!preferences.getBoolean("OverlayInit", false)) {
             defaultOverlay()
         }
+
+        OverlayProfileManager.ensureLoaded()
 
         // Reset 3ds touchscreen pointer ID
         touchscreenPointerId = -1
@@ -86,9 +172,134 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
 
     override fun draw(canvas: Canvas) {
         super.draw(canvas)
-        overlayButtons.forEach { it.draw(canvas) }
-        overlayDpads.forEach { it.draw(canvas) }
-        overlayJoysticks.forEach { it.draw(canvas) }
+
+        if (isInEditMode) {
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), editBackdropPaint)
+            if (OverlayProfileManager.gridSnapEnabled && width > 0 && height > 0) {
+                val gridStep = width.toFloat() / GRID_COLS
+                var gx = 0f
+                while (gx <= width) {
+                    canvas.drawLine(gx, 0f, gx, height.toFloat(), gridPaint)
+                    gx += gridStep
+                }
+                var gy = 0f
+                while (gy <= height) {
+                    canvas.drawLine(0f, gy, width.toFloat(), gy, gridPaint)
+                    gy += gridStep
+                }
+            }
+        }
+
+        val isPaused = actionListener?.isEmulationPaused() == true
+
+        overlayButtons.forEach { button ->
+            if (button.enabled || isInEditMode) {
+                button.draw(canvas, isPaused, isInEditMode)
+                if (isInEditMode) {
+                    drawEditAdornment(canvas, button.bounds, button.id, button.enabled)
+                }
+            }
+        }
+        overlayDpads.forEach { dpad ->
+            if (dpad.enabled || isInEditMode) {
+                dpad.draw(canvas, isInEditMode)
+                if (isInEditMode) {
+                    drawEditAdornment(canvas, dpad.bounds, dpad.upId, dpad.enabled)
+                }
+            }
+        }
+        overlayJoysticks.forEach { joystick ->
+            if (joystick.enabled || isInEditMode) {
+                joystick.draw(canvas, isInEditMode)
+                if (isInEditMode) {
+                    drawEditAdornment(
+                        canvas,
+                        joystick.bounds,
+                        joystick.joystickId,
+                        joystick.enabled
+                    )
+                }
+            }
+        }
+    }
+
+    private fun drawEditAdornment(canvas: Canvas, bounds: Rect, controlId: Int, enabled: Boolean) {
+        val density = resources.displayMetrics.density
+        if (!enabled) {
+            val minDim = min(bounds.width(), bounds.height()).toFloat()
+            disabledCrossPaint.strokeWidth = (minDim * 0.07f).coerceAtLeast(2f * density)
+            val padX = bounds.width() * 0.22f
+            val padY = bounds.height() * 0.22f
+            canvas.drawLine(
+                bounds.left + padX,
+                bounds.top + padY,
+                bounds.right - padX,
+                bounds.bottom - padY,
+                disabledCrossPaint
+            )
+            canvas.drawLine(
+                bounds.right - padX,
+                bounds.top + padY,
+                bounds.left + padX,
+                bounds.bottom - padY,
+                disabledCrossPaint
+            )
+        }
+
+        val isSelected = selectedControl?.id == controlId
+        adornmentPaint.strokeWidth = if (isSelected) 3f * density else 2f * density
+        adornmentPaint.color = when {
+            isSelected -> Color.rgb(0xFF, 0xD3, 0x3A)
+            enabled -> Color.rgb(0x3A, 0x6E, 0xA5)
+            else -> Color.argb(150, 0xFF, 0x6B, 0x6B)
+        }
+        adornmentRect.set(bounds)
+        val corner = 8f * density
+        canvas.drawRoundRect(adornmentRect, corner, corner, adornmentPaint)
+    }
+
+    fun selectControl(control: OverlayControl?) {
+        selectedControl = control
+        actionListener?.onSelectedControlChanged(control)
+        invalidate()
+    }
+
+    fun onActionShortTap(buttonId: Int) {
+        when (buttonId) {
+            NativeLibrary.ButtonType.BUTTON_QUICKSAVE -> actionListener?.onQuicksave()
+            NativeLibrary.ButtonType.BUTTON_QUICKLOAD -> actionListener?.onQuickload()
+            NativeLibrary.ButtonType.BUTTON_PAUSE -> {
+                actionListener?.onTogglePause()
+                invalidate()
+            }
+        }
+    }
+
+    fun onActionLongPress(buttonId: Int) {
+        when (buttonId) {
+            NativeLibrary.ButtonType.BUTTON_QUICKSAVE ->
+                actionListener?.onOpenSavestatePicker(true)
+
+            NativeLibrary.ButtonType.BUTTON_QUICKLOAD ->
+                actionListener?.onOpenSavestatePicker(false)
+
+            NativeLibrary.ButtonType.BUTTON_PAUSE ->
+                actionListener?.onOpenDrawerMenu()
+        }
+    }
+
+    private fun isFrontendActionButton(buttonId: Int): Boolean = when (buttonId) {
+        NativeLibrary.ButtonType.BUTTON_SWAP,
+        NativeLibrary.ButtonType.BUTTON_TURBO,
+        NativeLibrary.ButtonType.BUTTON_TURBO_2,
+        NativeLibrary.ButtonType.BUTTON_TURBO_3,
+        NativeLibrary.ButtonType.BUTTON_QUICKSAVE,
+        NativeLibrary.ButtonType.BUTTON_QUICKLOAD,
+        NativeLibrary.ButtonType.BUTTON_PAUSE,
+        NativeLibrary.ButtonType.BUTTON_SCREENSHOT,
+        Hotkey.COMBO_BUTTON.button -> true
+
+        else -> false
     }
 
     private fun swapScreen() {
@@ -207,24 +418,49 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                         continue
                     }
                     anyOverlayStateChanged = true
-                    // TODO - switch these to using standard hotkey buttons instead of nativelibrary buttons
-                    if (button.id == NativeLibrary.ButtonType.BUTTON_SWAP &&
-                        button.status == NativeLibrary.ButtonState.PRESSED
-                    ) {
-                        swapScreen()
-                    } else if (button.id == NativeLibrary.ButtonType.BUTTON_TURBO &&
-                        button.status == NativeLibrary.ButtonState.PRESSED
-                    ) {
-                        TurboHelper.toggleTurbo(true)
-                    } else if (button.id == Hotkey.COMBO_BUTTON.button) {
-                        ComboHelper.comboActivate(button.status)
+                    when (button.id) {
+                        NativeLibrary.ButtonType.BUTTON_SWAP -> {
+                            if (button.status == NativeLibrary.ButtonState.PRESSED) {
+                                swapScreen()
+                            }
+                        }
+
+                        NativeLibrary.ButtonType.BUTTON_TURBO -> {
+                            if (button.status == NativeLibrary.ButtonState.PRESSED) {
+                                TurboHelper.toggleTurboSlot(1, true)
+                            }
+                        }
+
+                        NativeLibrary.ButtonType.BUTTON_TURBO_2 -> {
+                            if (button.status == NativeLibrary.ButtonState.PRESSED) {
+                                TurboHelper.toggleTurboSlot(2, true)
+                            }
+                        }
+
+                        NativeLibrary.ButtonType.BUTTON_TURBO_3 -> {
+                            if (button.status == NativeLibrary.ButtonState.PRESSED) {
+                                TurboHelper.toggleTurboSlot(3, true)
+                            }
+                        }
+
+                        NativeLibrary.ButtonType.BUTTON_SCREENSHOT -> {
+                            if (button.status == NativeLibrary.ButtonState.PRESSED) {
+                                actionListener?.onTakeScreenshot()
+                            }
+                        }
+
+                        Hotkey.COMBO_BUTTON.button -> {
+                            ComboHelper.comboActivate(button.status)
+                        }
                     }
 
-                    NativeLibrary.onGamePadEvent(
-                        NativeLibrary.TOUCHSCREEN_DEVICE,
-                        button.id,
-                        button.status
-                    )
+                    if (!isFrontendActionButton(button.id)) {
+                        NativeLibrary.onGamePadEvent(
+                            NativeLibrary.TOUCHSCREEN_DEVICE,
+                            button.id,
+                            button.status
+                        )
+                    }
 
                     shouldUpdateView = true
                 }
@@ -302,10 +538,6 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                 isActionDown &&
                 !anyOverlayStateChanged
             ) {
-                // These need to be recalculated because touching the area
-                // right in the middle of the dpad (between the "buttons") or
-                // tapping a joystick in a certain way both don't cause
-                // `anyOverlayStateChanged` to be set to true
                 var isDpadPressed = false
                 for (dpad in overlayDpads) {
                     if (dpad.trackId == pointerId) {
@@ -334,310 +566,390 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
         return true
     }
 
+    private fun findControlAt(x: Int, y: Int): OverlayControl? {
+        // First pass: check enabled controls so visible controls take priority over hidden ones
+        for (button in overlayButtons) {
+            if (button.enabled && button.bounds.contains(x, y)) {
+                return OverlayControl.fromId(button.id)
+            }
+        }
+        for (dpad in overlayDpads) {
+            if (dpad.enabled && dpad.bounds.contains(x, y)) {
+                return OverlayControl.fromId(dpad.upId)
+            }
+        }
+        for (joystick in overlayJoysticks) {
+            if (joystick.enabled && joystick.bounds.contains(x, y)) {
+                return OverlayControl.fromId(joystick.joystickId)
+            }
+        }
+        // Second pass: disabled controls (visible in edit mode)
+        for (button in overlayButtons) {
+            if (!button.enabled && button.bounds.contains(x, y)) {
+                return OverlayControl.fromId(button.id)
+            }
+        }
+        for (dpad in overlayDpads) {
+            if (!dpad.enabled && dpad.bounds.contains(x, y)) {
+                return OverlayControl.fromId(dpad.upId)
+            }
+        }
+        for (joystick in overlayJoysticks) {
+            if (!joystick.enabled && joystick.bounds.contains(x, y)) {
+                return OverlayControl.fromId(joystick.joystickId)
+            }
+        }
+        return null
+    }
+
+    private fun snapTopLeftToGrid(left: Int, top: Int, w: Int, h: Int): Pair<Int, Int> {
+        if (!OverlayProfileManager.gridSnapEnabled || width <= 0 || height <= 0) {
+            return left to top
+        }
+        val gridPx = width.toFloat() / GRID_COLS
+        if (gridPx <= 1f) return left to top
+        val cx = left + w / 2f
+        val cy = top + h / 2f
+        val snappedCx = (cx / gridPx).roundToInt() * gridPx
+        val snappedCy = (cy / gridPx).roundToInt() * gridPx
+        val newLeft = (snappedCx - w / 2f).roundToInt().coerceIn(0, (width - w).coerceAtLeast(0))
+        val newTop = (snappedCy - h / 2f).roundToInt().coerceIn(0, (height - h).coerceAtLeast(0))
+        return newLeft to newTop
+    }
+
     fun onTouchWhileEditing(event: MotionEvent): Boolean {
+        scaleGestureDetector.onTouchEvent(event)
+        if (isPinchScaling || event.pointerCount > 1) {
+            return true
+        }
+
         val pointerIndex = event.actionIndex
         val fingerPositionX = event.getX(pointerIndex).toInt()
         val fingerPositionY = event.getY(pointerIndex).toInt()
         val orientation =
-            if (resources.configuration.orientation ==
-                Configuration.ORIENTATION_PORTRAIT
-            ) {
+            if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
                 "-Portrait"
             } else {
                 ""
             }
 
-        // Maybe combine Button and Joystick as subclasses of the same parent?
-        // Or maybe create an interface like IMoveableHUDControl?
-        overlayButtons.forEach {
-            // Determine the button state to apply based on the MotionEvent action flag.
-            when (event.action and MotionEvent.ACTION_MASK) {
-                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
-                    // If no button is being moved now, remember the currently touched button to move.
-                    if (buttonBeingConfigured == null &&
-                        it.bounds.contains(fingerPositionX, fingerPositionY)
-                    ) {
-                        buttonBeingConfigured = it
-                        buttonBeingConfigured!!.onConfigureTouch(event)
-                    }
+        when (event.action and MotionEvent.ACTION_MASK) {
+            MotionEvent.ACTION_DOWN -> {
+                editDownX = event.x
+                editDownY = event.y
+                editMoved = false
+                buttonBeingConfigured = null
+                dpadBeingConfigured = null
+                joystickBeingConfigured = null
 
-                MotionEvent.ACTION_MOVE -> if (buttonBeingConfigured != null) {
-                    buttonBeingConfigured!!.onConfigureTouch(event)
+                val hitControl = findControlAt(fingerPositionX, fingerPositionY)
+                if (hitControl != null) {
+                    editTouchedEmptySpace = false
+                    selectControl(hitControl)
+                    when (hitControl) {
+                        OverlayControl.DPAD -> {
+                            dpadBeingConfigured = overlayDpads.firstOrNull()
+                            dpadBeingConfigured?.onConfigureTouch(event)
+                        }
+
+                        OverlayControl.STICK_MAIN,
+                        OverlayControl.STICK_C -> {
+                            joystickBeingConfigured =
+                                overlayJoysticks.firstOrNull { it.joystickId == hitControl.id }
+                            joystickBeingConfigured?.onConfigureTouch(event)
+                        }
+
+                        else -> {
+                            buttonBeingConfigured =
+                                overlayButtons.firstOrNull { it.id == hitControl.id }
+                            buttonBeingConfigured?.onConfigureTouch(event)
+                        }
+                    }
+                } else {
+                    editTouchedEmptySpace = true
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (hypot(event.x - editDownX, event.y - editDownY) > 10f) {
+                    editMoved = true
+                }
+                buttonBeingConfigured?.let { btn ->
+                    btn.onConfigureTouch(event)
                     invalidate()
                     return true
                 }
+                dpadBeingConfigured?.let { dpad ->
+                    dpad.onConfigureTouch(event)
+                    invalidate()
+                    return true
+                }
+                joystickBeingConfigured?.let { stick ->
+                    stick.onConfigureTouch(event)
+                    invalidate()
+                    return true
+                }
+            }
 
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> if (buttonBeingConfigured ==
-                    it
-                ) {
-                    // Persist button position by saving new place.
-                    saveControlPosition(
-                        buttonBeingConfigured!!.id,
-                        buttonBeingConfigured!!.bounds.left,
-                        buttonBeingConfigured!!.bounds.top,
-                        orientation
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                buttonBeingConfigured?.let { btn ->
+                    val (snappedX, snappedY) = snapTopLeftToGrid(
+                        btn.bounds.left,
+                        btn.bounds.top,
+                        btn.width,
+                        btn.height
                     )
+                    btn.setPosition(snappedX, snappedY)
+                    btn.setBounds(snappedX, snappedY, snappedX + btn.width, snappedY + btn.height)
+                    saveControlPosition(btn.id, snappedX, snappedY, orientation)
                     buttonBeingConfigured = null
-                }
-            }
-        }
-        overlayDpads.forEach {
-            // Determine the button state to apply based on the MotionEvent action flag.
-            when (event.action and MotionEvent.ACTION_MASK) {
-                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
-                    // If no button is being moved now, remember the currently touched button to move.
-                    if (buttonBeingConfigured == null &&
-                        it.bounds.contains(fingerPositionX, fingerPositionY)
-                    ) {
-                        dpadBeingConfigured = it
-                        dpadBeingConfigured!!.onConfigureTouch(event)
-                    }
-
-                MotionEvent.ACTION_MOVE -> if (dpadBeingConfigured != null) {
-                    dpadBeingConfigured!!.onConfigureTouch(event)
                     invalidate()
-                    return true
                 }
-
-                MotionEvent.ACTION_UP,
-                MotionEvent.ACTION_POINTER_UP -> if (dpadBeingConfigured == it) {
-                    // Persist button position by saving new place.
-                    saveControlPosition(
-                        dpadBeingConfigured!!.upId,
-                        dpadBeingConfigured!!.bounds.left,
-                        dpadBeingConfigured!!.bounds.top,
-                        orientation
+                dpadBeingConfigured?.let { dpad ->
+                    val (snappedX, snappedY) = snapTopLeftToGrid(
+                        dpad.bounds.left,
+                        dpad.bounds.top,
+                        dpad.width,
+                        dpad.height
                     )
+                    dpad.setPosition(snappedX, snappedY)
+                    dpad.setBounds(
+                        snappedX,
+                        snappedY,
+                        snappedX + dpad.width,
+                        snappedY + dpad.height
+                    )
+                    saveControlPosition(dpad.upId, snappedX, snappedY, orientation)
                     dpadBeingConfigured = null
-                }
-            }
-        }
-        overlayJoysticks.forEach {
-            when (event.action) {
-                MotionEvent.ACTION_DOWN,
-                MotionEvent.ACTION_POINTER_DOWN -> if (joystickBeingConfigured == null &&
-                    it.bounds.contains(fingerPositionX, fingerPositionY)
-                ) {
-                    joystickBeingConfigured = it
-                    joystickBeingConfigured!!.onConfigureTouch(event)
-                }
-
-                MotionEvent.ACTION_MOVE -> if (joystickBeingConfigured != null) {
-                    joystickBeingConfigured!!.onConfigureTouch(event)
                     invalidate()
                 }
-
-                MotionEvent.ACTION_UP,
-                MotionEvent.ACTION_POINTER_UP -> if (joystickBeingConfigured != null) {
-                    saveControlPosition(
-                        joystickBeingConfigured!!.joystickId,
-                        joystickBeingConfigured!!.bounds.left,
-                        joystickBeingConfigured!!.bounds.top,
-                        orientation
+                joystickBeingConfigured?.let { stick ->
+                    val (snappedX, snappedY) = snapTopLeftToGrid(
+                        stick.bounds.left,
+                        stick.bounds.top,
+                        stick.bounds.width(),
+                        stick.bounds.height()
                     )
+                    saveControlPosition(stick.joystickId, snappedX, snappedY, orientation)
                     joystickBeingConfigured = null
+                    refreshControls()
                 }
+                if (editTouchedEmptySpace && !editMoved) {
+                    selectControl(null)
+                }
+                editTouchedEmptySpace = false
             }
         }
         return true
     }
 
     private fun addOverlayControls(orientation: String) {
-        if (preferences.getBoolean("buttonToggle0", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_a,
-                    R.drawable.button_a_pressed,
-                    NativeLibrary.ButtonType.BUTTON_A,
-                    orientation
+        for (control in OverlayControl.entries) {
+            val isEnabled = preferences.getBoolean(control.togglePrefKey, control.defaultEnabled)
+            if (!isEnabled && !isInEditMode) {
+                continue
+            }
+            when (control) {
+                OverlayControl.BUTTON_A -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_a,
+                        R.drawable.button_a_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
                 )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle1", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_b,
-                    R.drawable.button_b_pressed,
-                    NativeLibrary.ButtonType.BUTTON_B,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle2", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_x,
-                    R.drawable.button_x_pressed,
-                    NativeLibrary.ButtonType.BUTTON_X,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle3", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_y,
-                    R.drawable.button_y_pressed,
-                    NativeLibrary.ButtonType.BUTTON_Y,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle4", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_l,
-                    R.drawable.button_l_pressed,
-                    NativeLibrary.ButtonType.TRIGGER_L,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle5", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_r,
-                    R.drawable.button_r_pressed,
-                    NativeLibrary.ButtonType.TRIGGER_R,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle6", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_zl,
-                    R.drawable.button_zl_pressed,
-                    NativeLibrary.ButtonType.BUTTON_ZL,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle7", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_zr,
-                    R.drawable.button_zr_pressed,
-                    NativeLibrary.ButtonType.BUTTON_ZR,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle8", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_start,
-                    R.drawable.button_start_pressed,
-                    NativeLibrary.ButtonType.BUTTON_START,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle9", true)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_select,
-                    R.drawable.button_select_pressed,
-                    NativeLibrary.ButtonType.BUTTON_SELECT,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle10", true)) {
-            overlayDpads.add(
-                initializeOverlayDpad(
-                    context,
-                    R.drawable.dpad,
-                    R.drawable.dpad_pressed_one_direction,
-                    R.drawable.dpad_pressed_two_directions,
-                    NativeLibrary.ButtonType.DPAD_UP,
-                    NativeLibrary.ButtonType.DPAD_DOWN,
-                    NativeLibrary.ButtonType.DPAD_LEFT,
-                    NativeLibrary.ButtonType.DPAD_RIGHT,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle11", true)) {
-            overlayJoysticks.add(
-                initializeOverlayJoystick(
-                    context,
-                    R.drawable.stick_main_range,
-                    R.drawable.stick_main,
-                    R.drawable.stick_main_pressed,
-                    NativeLibrary.ButtonType.STICK_LEFT,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle12", false)) {
-            overlayJoysticks.add(
-                initializeOverlayJoystick(
-                    context,
-                    R.drawable.stick_c_range,
-                    R.drawable.stick_c,
-                    R.drawable.stick_c_pressed,
-                    NativeLibrary.ButtonType.STICK_C,
-                    orientation
-                )
-            )
-        }
-        if (preferences.getBoolean("buttonToggle13", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_home,
-                    R.drawable.button_home_pressed,
-                    NativeLibrary.ButtonType.BUTTON_HOME,
-                    orientation
-                )
-            )
-        }
 
-        if (preferences.getBoolean("buttonToggle14", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_swap,
-                    R.drawable.button_swap_pressed,
-                    NativeLibrary.ButtonType.BUTTON_SWAP,
-                    orientation
+                OverlayControl.BUTTON_B -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_b,
+                        R.drawable.button_b_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
                 )
-            )
-        }
 
-        if (preferences.getBoolean("buttonToggle15", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_turbo,
-                    R.drawable.button_turbo_pressed,
-                    NativeLibrary.ButtonType.BUTTON_TURBO,
-                    orientation
+                OverlayControl.BUTTON_X -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_x,
+                        R.drawable.button_x_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
                 )
-            )
-        }
 
-        if (preferences.getBoolean("buttonToggle16", false)) {
-            overlayButtons.add(
-                initializeOverlayButton(
-                    context,
-                    R.drawable.button_combo,
-                    R.drawable.button_combo_pressed,
-                    Hotkey.COMBO_BUTTON.button,
-                    orientation
+                OverlayControl.BUTTON_Y -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_y,
+                        R.drawable.button_y_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
                 )
-            )
+
+                OverlayControl.TRIGGER_L -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_l,
+                        R.drawable.button_l_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.TRIGGER_R -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_r,
+                        R.drawable.button_r_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_ZL -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_zl,
+                        R.drawable.button_zl_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_ZR -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_zr,
+                        R.drawable.button_zr_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_START -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_start,
+                        R.drawable.button_start_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_SELECT -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_select,
+                        R.drawable.button_select_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.DPAD -> overlayDpads.add(
+                    initializeOverlayDpad(
+                        context,
+                        R.drawable.dpad,
+                        R.drawable.dpad_pressed_one_direction,
+                        R.drawable.dpad_pressed_two_directions,
+                        NativeLibrary.ButtonType.DPAD_UP,
+                        NativeLibrary.ButtonType.DPAD_DOWN,
+                        NativeLibrary.ButtonType.DPAD_LEFT,
+                        NativeLibrary.ButtonType.DPAD_RIGHT,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.STICK_MAIN -> overlayJoysticks.add(
+                    initializeOverlayJoystick(
+                        context,
+                        R.drawable.stick_main_range,
+                        R.drawable.stick_main,
+                        R.drawable.stick_main_pressed,
+                        NativeLibrary.ButtonType.STICK_LEFT,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.STICK_C -> overlayJoysticks.add(
+                    initializeOverlayJoystick(
+                        context,
+                        R.drawable.stick_c_range,
+                        R.drawable.stick_c,
+                        R.drawable.stick_c_pressed,
+                        NativeLibrary.ButtonType.STICK_C,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_HOME -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_home,
+                        R.drawable.button_home_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_SWAP -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_swap,
+                        R.drawable.button_swap_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_COMBO -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_combo,
+                        R.drawable.button_combo_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+
+                OverlayControl.BUTTON_TURBO,
+                OverlayControl.BUTTON_TURBO_2,
+                OverlayControl.BUTTON_TURBO_3,
+                OverlayControl.BUTTON_QUICKSAVE,
+                OverlayControl.BUTTON_QUICKLOAD,
+                OverlayControl.BUTTON_PAUSE,
+                OverlayControl.BUTTON_SCREENSHOT -> overlayButtons.add(
+                    initializeOverlayButton(
+                        context,
+                        R.drawable.button_turbo,
+                        R.drawable.button_turbo_pressed,
+                        control,
+                        orientation,
+                        isEnabled
+                    )
+                )
+            }
         }
     }
 
@@ -653,8 +965,8 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                 ""
             }
 
-        // Add all the enabled overlay items back to the HashSet.
-        if (EmulationMenuSettings.showOverlay) {
+        // In edit mode, always show controls so the user can configure them even if overlay was hidden
+        if (EmulationMenuSettings.showOverlay || isInEditMode) {
             addOverlayControls(orientation)
         }
         invalidate()
@@ -667,14 +979,20 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
             .apply()
     }
 
-    fun setIsInEditMode(isInEditMode: Boolean) {
-        this.isInEditMode = isInEditMode
+    fun setIsInEditMode(editMode: Boolean) {
+        if (this.isInEditMode == editMode) return
+        this.isInEditMode = editMode
+        if (!editMode) {
+            selectedControl = null
+            buttonBeingConfigured = null
+            dpadBeingConfigured = null
+            joystickBeingConfigured = null
+        }
+        refreshControls()
     }
 
     private fun defaultOverlay() {
         if (!preferences.getBoolean("OverlayInit", false)) {
-            // It's possible that a user has created their overlay before this was added
-            // Only change the overlay if the 'A' button is not in the upper corner.
             val aButtonPosition = preferences.getFloat(
                 NativeLibrary.ButtonType.BUTTON_A.toString() + "-X",
                 0f
@@ -698,7 +1016,8 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
     }
 
     fun resetButtonPlacement() {
-        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val isLandscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         if (isLandscape) {
             defaultOverlayLandscape()
         } else {
@@ -707,8 +1026,7 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
         refreshControls()
     }
 
-    private fun defaultOverlayLandscape() {
-        // Get screen size
+    private fun getSafeScreenDimensions(forLandscape: Boolean): Pair<Float, Float> {
         val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             context.display
         } else {
@@ -733,346 +1051,97 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
         val marginsY = (cutout?.safeInsetTop?.plus(cutout.safeInsetBottom)) ?: 0
         var maxX = displayWidth - marginsX
         var maxY = displayHeight - marginsY
-        // Height and width changes depending on orientation. Use the larger value for height.
-        if (maxY > maxX) {
-            val tmp = maxX
-            maxX = maxY
-            maxY = tmp
+        if (forLandscape) {
+            if (maxY > maxX) {
+                val tmp = maxX
+                maxX = maxY
+                maxY = tmp
+            }
+        } else {
+            if (maxY < maxX) {
+                val tmp = maxX
+                maxX = maxY
+                maxY = tmp
+            }
         }
+        return maxX to maxY
+    }
 
-        // Each value is a percent from max X/Y stored as an int. Have to bring that value down
-        // to a decimal before multiplying by MAX X/Y.
-        preferences.edit()
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_A.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_A_X).toFloat() / 1000 * maxX
+    private fun defaultOverlayLandscape() {
+        val (maxX, maxY) = getSafeScreenDimensions(forLandscape = true)
+        val editor = preferences.edit()
+        for (control in OverlayControl.entries) {
+            editor.putFloat(
+                control.xPrefKey(""),
+                resources.getInteger(control.landscapeXRes).toFloat() / 1000f * maxX
             )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_A.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_A_Y).toFloat() / 1000 * maxY
+            editor.putFloat(
+                control.yPrefKey(""),
+                resources.getInteger(control.landscapeYRes).toFloat() / 1000f * maxY
             )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_B.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_B_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_B.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_B_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_X.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_X_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_X.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_X_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_Y.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_Y_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_Y.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_Y_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZL.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZL_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZL.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZL_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZR.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZR_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZR.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZR_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.DPAD_UP.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_UP_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.DPAD_UP.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_UP_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_L.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_TRIGGER_L_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_L.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_TRIGGER_L_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_R.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_TRIGGER_R_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_R.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_TRIGGER_R_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_START.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_START_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_START.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_START_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SELECT.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_SELECT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SELECT.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_SELECT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_HOME.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_HOME_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_HOME.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_HOME_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_C.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_STICK_C_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_C.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_STICK_C_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_LEFT.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_STICK_MAIN_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_LEFT.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_STICK_MAIN_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SWAP.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_SWAP_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SWAP.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_SWAP_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_TURBO.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_TURBO_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_TURBO.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_TURBO_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                Hotkey.COMBO_BUTTON.button.toString() + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_COMBO_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                Hotkey.COMBO_BUTTON.button.toString() + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_COMBO_Y).toFloat() / 1000 * maxY
-            )
-            .apply()
+        }
+        editor.apply()
     }
 
     private fun defaultOverlayPortrait() {
-        // Get screen size
-        val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            context.display
-        } else {
-            @Suppress("DEPRECATION")
-            (context as Activity).windowManager.defaultDisplay
-        }
-        var displayWidth: Float
-        var displayHeight: Float
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val displayMetrics = (context as Activity).windowManager.maximumWindowMetrics.bounds
-            displayWidth = displayMetrics.width().toFloat()
-            displayHeight = displayMetrics.height().toFloat()
-        } else {
-            val displayMetrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            display.getMetrics(displayMetrics)
-            displayWidth = displayMetrics.widthPixels.toFloat()
-            displayHeight = displayMetrics.heightPixels.toFloat()
-        }
-        val cutout = ViewCompat.getRootWindowInsets(this)?.displayCutout
-        val marginsX = (cutout?.safeInsetLeft?.plus(cutout.safeInsetRight)) ?: 0
-        val marginsY = (cutout?.safeInsetTop?.plus(cutout.safeInsetBottom)) ?: 0
-        var maxX = displayWidth - marginsX
-        var maxY = displayHeight - marginsY
-        // Height and width changes depending on orientation. Use the larger value for height.
-        if (maxY < maxX) {
-            val tmp = maxX
-            maxX = maxY
-            maxY = tmp
-        }
+        val (maxX, maxY) = getSafeScreenDimensions(forLandscape = false)
         val portrait = "-Portrait"
-
-        // Each value is a percent from max X/Y stored as an int. Have to bring that value down
-        // to a decimal before multiplying by MAX X/Y.
-        preferences.edit()
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_A.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_A_PORTRAIT_X).toFloat() / 1000 * maxX
+        val editor = preferences.edit()
+        for (control in OverlayControl.entries) {
+            editor.putFloat(
+                control.xPrefKey(portrait),
+                resources.getInteger(control.portraitXRes).toFloat() / 1000f * maxX
             )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_A.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_A_PORTRAIT_Y).toFloat() / 1000 * maxY
+            editor.putFloat(
+                control.yPrefKey(portrait),
+                resources.getInteger(control.portraitYRes).toFloat() / 1000f * maxY
             )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_B.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_B_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_B.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_B_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_X.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_X_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_X.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_X_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_Y.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_Y_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_Y.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_Y_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZL.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZL_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZL.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZL_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZR.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZR_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_ZR.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_ZR_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.DPAD_UP.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_UP_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.DPAD_UP.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_UP_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_L.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_TRIGGER_L_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_L.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_TRIGGER_L_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_R.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_TRIGGER_R_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.TRIGGER_R.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_TRIGGER_R_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_START.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_START_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_START.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_START_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SELECT.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_SELECT_PORTRAIT_X)
-                    .toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SELECT.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_SELECT_PORTRAIT_Y)
-                    .toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_HOME.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_HOME_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_HOME.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_HOME_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_C.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_STICK_C_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_C.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_STICK_C_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_LEFT.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_STICK_MAIN_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.STICK_LEFT.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_STICK_MAIN_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SWAP.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_SWAP_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_SWAP.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_SWAP_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_TURBO.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_TURBO_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                NativeLibrary.ButtonType.BUTTON_TURBO.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_TURBO_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .putFloat(
-                Hotkey.COMBO_BUTTON.button.toString() + portrait + "-X",
-                resources.getInteger(R.integer.N3DS_BUTTON_COMBO_PORTRAIT_X).toFloat() / 1000 * maxX
-            )
-            .putFloat(
-                Hotkey.COMBO_BUTTON.button.toString() + portrait + "-Y",
-                resources.getInteger(R.integer.N3DS_BUTTON_COMBO_PORTRAIT_Y).toFloat() / 1000 * maxY
-            )
-            .apply()
+        }
+        editor.apply()
     }
 
     override fun isInEditMode(): Boolean = isInEditMode
 
     companion object {
+        private const val GRID_COLS = 24f
+
         private val preferences
             get() = PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
 
+        private fun ensureControlPositionInitialized(
+            context: Context,
+            control: OverlayControl,
+            orientation: String
+        ) {
+            val xKey = control.xPrefKey(orientation)
+            val yKey = control.yPrefKey(orientation)
+            if (preferences.contains(xKey) && preferences.contains(yKey)) {
+                return
+            }
+            val dm = context.resources.displayMetrics
+            val isPortrait = orientation.isNotEmpty()
+            val maxX = if (isPortrait) {
+                min(dm.widthPixels, dm.heightPixels).toFloat()
+            } else {
+                kotlin.math.max(dm.widthPixels, dm.heightPixels).toFloat()
+            }
+            val maxY = if (isPortrait) {
+                kotlin.math.max(dm.widthPixels, dm.heightPixels).toFloat()
+            } else {
+                min(dm.widthPixels, dm.heightPixels).toFloat()
+            }
+            val xRes = if (isPortrait) control.portraitXRes else control.landscapeXRes
+            val yRes = if (isPortrait) control.portraitYRes else control.landscapeYRes
+            val defX = context.resources.getInteger(xRes).toFloat() / 1000f * maxX
+            val defY = context.resources.getInteger(yRes).toFloat() / 1000f * maxY
+            preferences.edit()
+                .putFloat(xKey, defX)
+                .putFloat(yKey, defY)
+                .apply()
+        }
+
         /**
          * Resizes a [Bitmap] by a given scale factor
-         *
-         * @param context       Context for getting the drawable/vector drawable
-         * @param drawableId    The ID of the drawable to scale.
-         * @param scale         The scale factor for the bitmap.
-         * @return The scaled [Bitmap]
          */
         private fun getBitmap(context: Context, drawableId: Int, scale: Float): Bitmap {
             try {
@@ -1084,8 +1153,8 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
             val vectorDrawable = ContextCompat.getDrawable(context, drawableId) as VectorDrawable
 
             val bitmap = Bitmap.createBitmap(
-                (vectorDrawable.intrinsicWidth * scale).toInt(),
-                (vectorDrawable.intrinsicHeight * scale).toInt(),
+                (vectorDrawable.intrinsicWidth * scale).toInt().coerceAtLeast(1),
+                (vectorDrawable.intrinsicHeight * scale).toInt().coerceAtLeast(1),
                 Bitmap.Config.ARGB_8888
             )
 
@@ -1098,94 +1167,39 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
 
         /**
          * Resizes a [Bitmap] by a given scale factor
-         *
-         * @param context The current [Context]
-         * @param bitmap  The [Bitmap] to scale.
-         * @param scale   The scale factor for the bitmap.
-         * @return The scaled [Bitmap]
          */
         private fun resizeBitmap(context: Context, bitmap: Bitmap, scale: Float): Bitmap {
-            // Determine the button size based on the smaller screen dimension.
-            // This makes sure the buttons are the same size in both portrait and landscape.
             val dm = context.resources.displayMetrics
             val minDimension = min(dm.widthPixels, dm.heightPixels)
+            val targetSize = (minDimension * scale).toInt().coerceAtLeast(8)
             return Bitmap.createScaledBitmap(
                 bitmap,
-                (minDimension * scale).toInt(),
-                (minDimension * scale).toInt(),
+                targetSize,
+                targetSize,
                 true
             )
         }
 
-        /**
-         * Initializes an InputOverlayDrawableButton, given by resId, with all of the
-         * parameters set for it to be properly shown on the InputOverlay.
-         *
-         *
-         * This works due to the way the X and Y coordinates are stored within
-         * the [SharedPreferences].
-         *
-         *
-         * In the input overlay configuration menu,
-         * once a touch event begins and then ends (ie. Organizing the buttons to one's own liking for the overlay).
-         * the X and Y coordinates of the button at the END of its touch event
-         * (when you remove your finger/stylus from the touchscreen) are then stored
-         * within a SharedPreferences instance so that those values can be retrieved here.
-         *
-         *
-         * This has a few benefits over the conventional way of storing the values
-         * (ie. within the Citra ini file).
-         *
-         *  * No native calls
-         *  * Keeps Android-only values inside the Android environment
-         *
-         *
-         *
-         * Technically no modifications should need to be performed on the returned
-         * InputOverlayDrawableButton. Simply add it to the HashSet of overlay items and wait
-         * for Android to call the onDraw method.
-         *
-         * @param context      The current [Context].
-         * @param defaultResId The resource ID of the [Drawable] to get the [Bitmap] of (Default State).
-         * @param pressedResId The resource ID of the [Drawable] to get the [Bitmap] of (Pressed State).
-         * @param buttonId     Identifier for determining what type of button the initialized InputOverlayDrawableButton represents.
-         * @return An [InputOverlayDrawableButton] with the correct drawing bounds set.
-         */
         private fun initializeOverlayButton(
             context: Context,
             defaultResId: Int,
             pressedResId: Int,
-            buttonId: Int,
-            orientation: String
+            control: OverlayControl,
+            orientation: String,
+            isEnabled: Boolean
         ): InputOverlayDrawableButton {
-            // Resources handle for fetching the initial Drawable resource.
             val res = context.resources
+            ensureControlPositionInitialized(context, control, orientation)
 
-            // Decide scale based on button ID and user preference
-            var scale: Float = when (buttonId) {
-                NativeLibrary.ButtonType.BUTTON_HOME,
-                NativeLibrary.ButtonType.BUTTON_START,
-                NativeLibrary.ButtonType.BUTTON_SELECT,
-                NativeLibrary.ButtonType.BUTTON_SWAP -> 0.08f
-
-                NativeLibrary.ButtonType.BUTTON_TURBO -> 0.10f
-
-                NativeLibrary.ButtonType.TRIGGER_L,
-                NativeLibrary.ButtonType.TRIGGER_R,
-                NativeLibrary.ButtonType.BUTTON_ZL,
-                NativeLibrary.ButtonType.BUTTON_ZR -> 0.18f
-
-                else -> 0.11f
-            }
+            var scale: Float = control.baseScale
             scale *= (preferences.getInt("controlScale", 50) + 50).toFloat()
             scale /= 100f
 
-            scale *= (preferences.getInt("controlScale-$buttonId", 50) + 50).toFloat()
+            scale *= (preferences.getInt(control.scalePrefKey, 50) + 50).toFloat()
             scale /= 100f
 
             val opacity: Int = preferences.getInt("controlOpacity", 50) * 255 / 100
 
-            // Initialize the InputOverlayDrawableButton.
             val defaultStateBitmap = getBitmap(context, defaultResId, scale)
             val pressedStateBitmap = getBitmap(context, pressedResId, scale)
             val overlayDrawable =
@@ -1193,41 +1207,23 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                     res,
                     defaultStateBitmap,
                     pressedStateBitmap,
-                    buttonId,
-                    opacity
+                    control.id,
+                    opacity,
+                    isEnabled
                 )
 
-            // The X and Y coordinates of the InputOverlayDrawableButton on the InputOverlay.
-            // These were set in the input overlay configuration menu.
-            val xKey = "$buttonId$orientation-X"
-            val yKey = "$buttonId$orientation-Y"
+            val xKey = control.xPrefKey(orientation)
+            val yKey = control.yPrefKey(orientation)
             val drawableX = preferences.getFloat(xKey, 0f).toInt()
             val drawableY = preferences.getFloat(yKey, 0f).toInt()
             val width = overlayDrawable.width
             val height = overlayDrawable.height
 
-            // Now set the bounds for the InputOverlayDrawableButton.
-            // This will dictate where on the screen (and the what the size) the InputOverlayDrawableButton will be.
             overlayDrawable.setBounds(drawableX, drawableY, drawableX + width, drawableY + height)
-
-            // Need to set the image's position
             overlayDrawable.setPosition(drawableX, drawableY)
             return overlayDrawable
         }
 
-        /**
-         * Initializes an [InputOverlayDrawableDpad]
-         *
-         * @param context                   The current [Context].
-         * @param defaultResId              The [Bitmap] resource ID of the default sate.
-         * @param pressedOneDirectionResId  The [Bitmap] resource ID of the pressed sate in one direction.
-         * @param pressedTwoDirectionsResId The [Bitmap] resource ID of the pressed sate in two directions.
-         * @param buttonUp                  Identifier for the up button.
-         * @param buttonDown                Identifier for the down button.
-         * @param buttonLeft                Identifier for the left button.
-         * @param buttonRight               Identifier for the right button.
-         * @return the initialized [InputOverlayDrawableDpad]
-         */
         private fun initializeOverlayDpad(
             context: Context,
             defaultResId: Int,
@@ -1237,19 +1233,19 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
             buttonDown: Int,
             buttonLeft: Int,
             buttonRight: Int,
-            orientation: String
+            orientation: String,
+            isEnabled: Boolean
         ): InputOverlayDrawableDpad {
-            // Resources handle for fetching the initial Drawable resource.
             val res = context.resources
+            ensureControlPositionInitialized(context, OverlayControl.DPAD, orientation)
 
-            // Decide scale based on button ID and user preference
-            var scale = 0.22f
+            var scale = OverlayControl.DPAD.baseScale
             scale *= (preferences.getInt("controlScale", 50) + 50).toFloat()
             scale /= 100f
 
             scale *= (
                 preferences.getInt(
-                    "controlScale-" + NativeLibrary.ButtonType.DPAD,
+                    OverlayControl.DPAD.scalePrefKey,
                     50
                 ) + 50
                 ).toFloat()
@@ -1258,7 +1254,6 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
 
             val opacity: Int = preferences.getInt("controlOpacity", 50) * 255 / 100
 
-            // Initialize the InputOverlayDrawableDpad.
             val defaultStateBitmap = getBitmap(context, defaultResId, scale)
             val pressedOneDirectionStateBitmap = getBitmap(context, pressedOneDirectionResId, scale)
             val pressedTwoDirectionsStateBitmap =
@@ -1272,48 +1267,34 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                 buttonDown,
                 buttonLeft,
                 buttonRight,
-                opacity
+                opacity,
+                isEnabled
             )
 
-            // The X and Y coordinates of the InputOverlayDrawableDpad on the InputOverlay.
-            // These were set in the input overlay configuration menu.
             val drawableX = preferences.getFloat("$buttonUp$orientation-X", 0f).toInt()
             val drawableY = preferences.getFloat("$buttonUp$orientation-Y", 0f).toInt()
             val width = overlayDrawable.width
             val height = overlayDrawable.height
 
-            // Now set the bounds for the InputOverlayDrawableDpad.
-            // This will dictate where on the screen (and the what the size) the InputOverlayDrawableDpad will be.
             overlayDrawable.setBounds(drawableX, drawableY, drawableX + width, drawableY + height)
-
-            // Need to set the image's position
             overlayDrawable.setPosition(drawableX, drawableY)
             return overlayDrawable
         }
 
-        /**
-         * Initializes an [InputOverlayDrawableJoystick]
-         *
-         * @param context         The current [Context]
-         * @param resOuter        Resource ID for the outer image of the joystick (the static image that shows the circular bounds).
-         * @param defaultResInner Resource ID for the default inner image of the joystick (the one you actually move around).
-         * @param pressedResInner Resource ID for the pressed inner image of the joystick.
-         * @param joystick        Identifier for which joystick this is.
-         * @return the initialized [InputOverlayDrawableJoystick].
-         */
         private fun initializeOverlayJoystick(
             context: Context,
             resOuter: Int,
             defaultResInner: Int,
             pressedResInner: Int,
             joystick: Int,
-            orientation: String
+            orientation: String,
+            isEnabled: Boolean
         ): InputOverlayDrawableJoystick {
-            // Resources handle for fetching the initial Drawable resource.
             val res = context.resources
+            val control = OverlayControl.fromId(joystick) ?: OverlayControl.STICK_MAIN
+            ensureControlPositionInitialized(context, control, orientation)
 
-            // Decide scale based on user preference
-            var scale = 0.275f
+            var scale = control.baseScale
             scale *= (preferences.getInt("controlScale", 50) + 50).toFloat()
             scale /= 100f
 
@@ -1322,24 +1303,18 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
 
             val opacity: Int = preferences.getInt("controlOpacity", 50) * 255 / 100
 
-            // Initialize the InputOverlayDrawableJoystick.
             val bitmapOuter = getBitmap(context, resOuter, scale)
             val bitmapInnerDefault = getBitmap(context, defaultResInner, scale)
             val bitmapInnerPressed = getBitmap(context, pressedResInner, scale)
 
-            // The X and Y coordinates of the InputOverlayDrawableButton on the InputOverlay.
-            // These were set in the input overlay configuration menu.
             val drawableX = preferences.getFloat("$joystick$orientation-X", 0f).toInt()
             val drawableY = preferences.getFloat("$joystick$orientation-Y", 0f).toInt()
 
-            // Decide inner scale based on joystick ID
             var outerScale = 1f
             if (joystick == NativeLibrary.ButtonType.STICK_C) {
                 outerScale = 2f
             }
 
-            // Now set the bounds for the InputOverlayDrawableJoystick.
-            // This will dictate where on the screen (and the what the size) the InputOverlayDrawableJoystick will be.
             val outerSize = bitmapOuter.width
             val outerRect = Rect(
                 drawableX,
@@ -1350,7 +1325,6 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
             val innerRect =
                 Rect(0, 0, (outerSize / outerScale).toInt(), (outerSize / outerScale).toInt())
 
-            // Send the drawableId to the joystick so it can be referenced when saving control position.
             val overlayDrawable = InputOverlayDrawableJoystick(
                 res,
                 bitmapOuter,
@@ -1359,10 +1333,10 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
                 outerRect,
                 innerRect,
                 joystick,
-                opacity
+                opacity,
+                isEnabled
             )
 
-            // Need to set the image's position
             overlayDrawable.setPosition(drawableX, drawableY)
             return overlayDrawable
         }

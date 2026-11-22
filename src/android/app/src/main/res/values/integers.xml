@@ -37,6 +37,18 @@
     <integer name="N3DS_BUTTON_TURBO_Y">850</integer>
     <integer name="N3DS_BUTTON_COMBO_X">740</integer>
     <integer name="N3DS_BUTTON_COMBO_Y">480</integer>
+    <integer name="N3DS_BUTTON_TURBO_2_X">700</integer>
+    <integer name="N3DS_BUTTON_TURBO_2_Y">850</integer>
+    <integer name="N3DS_BUTTON_TURBO_3_X">770</integer>
+    <integer name="N3DS_BUTTON_TURBO_3_Y">850</integer>
+    <integer name="N3DS_BUTTON_QUICKSAVE_X">290</integer>
+    <integer name="N3DS_BUTTON_QUICKSAVE_Y">850</integer>
+    <integer name="N3DS_BUTTON_QUICKLOAD_X">210</integer>
+    <integer name="N3DS_BUTTON_QUICKLOAD_Y">850</integer>
+    <integer name="N3DS_BUTTON_PAUSE_X">820</integer>
+    <integer name="N3DS_BUTTON_PAUSE_Y">25</integer>
+    <integer name="N3DS_BUTTON_SCREENSHOT_X">130</integer>
+    <integer name="N3DS_BUTTON_SCREENSHOT_Y">850</integer>
 
     <!-- Default N3DS portrait layout -->
     <integer name="N3DS_BUTTON_A_PORTRAIT_X">810</integer>
@@ -73,5 +85,17 @@
     <integer name="N3DS_BUTTON_TURBO_PORTRAIT_Y">720</integer>
     <integer name="N3DS_BUTTON_COMBO_PORTRAIT_X">450</integer>
     <integer name="N3DS_BUTTON_COMBO_PORTRAIT_Y">925</integer>
+    <integer name="N3DS_BUTTON_TURBO_2_PORTRAIT_X">560</integer>
+    <integer name="N3DS_BUTTON_TURBO_2_PORTRAIT_Y">720</integer>
+    <integer name="N3DS_BUTTON_TURBO_3_PORTRAIT_X">670</integer>
+    <integer name="N3DS_BUTTON_TURBO_3_PORTRAIT_Y">720</integer>
+    <integer name="N3DS_BUTTON_QUICKSAVE_PORTRAIT_X">340</integer>
+    <integer name="N3DS_BUTTON_QUICKSAVE_PORTRAIT_Y">720</integer>
+    <integer name="N3DS_BUTTON_QUICKLOAD_PORTRAIT_X">230</integer>
+    <integer name="N3DS_BUTTON_QUICKLOAD_PORTRAIT_Y">720</integer>
+    <integer name="N3DS_BUTTON_PAUSE_PORTRAIT_X">880</integer>
+    <integer name="N3DS_BUTTON_PAUSE_PORTRAIT_Y">25</integer>
+    <integer name="N3DS_BUTTON_SCREENSHOT_PORTRAIT_X">120</integer>
+    <integer name="N3DS_BUTTON_SCREENSHOT_PORTRAIT_Y">720</integer>
 
 </resources>

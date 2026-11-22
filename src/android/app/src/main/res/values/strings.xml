@@ -173,8 +173,38 @@
     <string name="button_start" translatable="false">START</string>
     <string name="button_home">HOME</string>
     <string name="button_swap">Swap Screens</string>
-    <string name="button_turbo">Turbo</string>
+    <string name="button_turbo">Turbo 1 (▶▶)</string>
     <string name="button_combo">Combo Button</string>
+    <string name="button_turbo_2">Turbo 2 (▶▶2)</string>
+    <string name="button_turbo_3">Turbo 3 (▶▶3)</string>
+    <string name="button_quicksave">Quicksave (SAVE)</string>
+    <string name="button_quickload">Quickload (LOAD)</string>
+    <string name="button_pause">Pause (⏸)</string>
+    <string name="button_screenshot">Screenshot (SHOT)</string>
+    <string name="screenshot_saved_toast">Screenshot saved to Pictures/Azahar</string>
+    <string name="screenshot_failed_toast">Failed to capture screenshot</string>
+    <string name="emulation_controller_profiles">Controller Profiles</string>
+    <string name="emulation_turbo_speeds">Turbo Speeds</string>
+    <string name="emulation_turbo_speed_slot">Turbo %1$d Speed</string>
+    <string name="overlay_profile_save_as">Save As</string>
+    <string name="overlay_profile_new_hint">New profile name</string>
+    <string name="overlay_profile_delete">Delete</string>
+    <string name="overlay_profile_active_badge">Profile: %1$s</string>
+    <string name="overlay_editor_save">Save</string>
+    <string name="overlay_editor_discard">Discard</string>
+    <string name="overlay_editor_reset">Reset</string>
+    <string name="overlay_editor_profiles">Profiles</string>
+    <string name="overlay_editor_controls">Controls</string>
+    <string name="overlay_editor_grid_on">Grid: On</string>
+    <string name="overlay_editor_grid_off">Grid: Off</string>
+    <string name="overlay_editor_slide_off">Slide: Off</string>
+    <string name="overlay_editor_slide_on">Slide: Follow</string>
+    <string name="overlay_editor_slide_hold">Slide: Hold 1st</string>
+    <string name="overlay_editor_floating_on">Floating Stick: On</string>
+    <string name="overlay_editor_floating_off">Floating Stick: Off</string>
+    <string name="overlay_editor_show">Show</string>
+    <string name="overlay_editor_hide">Hide</string>
+    <string name="overlay_editor_tap_hint">Tap any control to resize, show/hide, or set turbo speed • Pinch to resize</string>
     <string name="button_x" translatable="false">X</string>
     <string name="button_y" translatable="false">Y</string>
     <string name="button_l" translatable="false">L</string>

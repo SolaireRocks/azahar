@@ -21,8 +21,16 @@
         android:title="@string/emulation_edit_layout" />
 
     <item
+        android:id="@+id/menu_emulation_overlay_profiles"
+        android:title="@string/emulation_controller_profiles" />
+
+    <item
         android:id="@+id/menu_emulation_toggle_controls"
         android:title="@string/emulation_toggle_controls" />
+
+    <item
+        android:id="@+id/menu_emulation_turbo_speeds"
+        android:title="@string/emulation_turbo_speeds" />
 
     <item
         android:id="@+id/menu_emulation_adjust_scales"
@@ -82,6 +90,24 @@
             <item
                 android:id="@+id/menu_emulation_adjust_scale_button_turbo"
                 android:title="@string/button_turbo" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_turbo_2"
+                android:title="@string/button_turbo_2" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_turbo_3"
+                android:title="@string/button_turbo_3" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_quicksave"
+                android:title="@string/button_quicksave" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_quickload"
+                android:title="@string/button_quickload" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_pause"
+                android:title="@string/button_pause" />
+            <item
+                android:id="@+id/menu_emulation_adjust_scale_button_screenshot"
+                android:title="@string/button_screenshot" />
             <item
                 android:id="@+id/menu_emulation_adjust_scale_button_combo"
                 android:title="@string/button_combo" />
